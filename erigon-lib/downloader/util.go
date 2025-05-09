@@ -467,18 +467,27 @@ func readPeerID(db kv.RoDB) (peerID []byte, err error) {
 func ScheduleVerifyFile(ctx context.Context, t *torrent.Torrent, completePieces *atomic.Uint64) error {
 	ctx, cancel := context.WithCancel(ctx)
 	wg, wgctx := errgroup.WithContext(ctx)
-	wg.SetLimit(16)
+	// wg.SetLimit(16)
 
 	// piece changes happen asynchronously - we need to wait from them to complete
 	pieceChanges := t.SubscribePieceStateChanges()
 	inprogress := map[int]struct{}{}
-
-	for i := 0; i < t.NumPieces(); i++ {
+	piecesChan := make(chan int, t.NumPieces())
+	numpiece := t.NumPieces()
+	for i := 0; i < numpiece; i += 1 {
 		inprogress[i] = struct{}{}
-
-		i := i
+		piecesChan <- i
+	}
+	close(piecesChan)
+	batchNumber := runtime.GOMAXPROCS(-1)
+	if numpiece < batchNumber {
+		batchNumber = numpiece
+	}
+	for j := 0; j < batchNumber; j++ {
 		wg.Go(func() error {
-			t.Piece(i).VerifyData()
+			for i := range piecesChan {
+				t.Piece(i).VerifyData()
+			}
 			return nil
 		})
 	}
@@ -508,7 +517,6 @@ func ScheduleVerifyFile(ctx context.Context, t *torrent.Torrent, completePieces 
 				}
 				delete(inprogress, change.Index)
 			}
-
 			if len(inprogress) == 0 {
 				cancel()
 				return wg.Wait()
