@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -2375,7 +2376,8 @@ func (d *Downloader) VerifyData(ctx context.Context, whiteList []string, failFas
 		toVerify = append(toVerify, t)
 		total += t.NumPieces()
 	}
-	d.logger.Info("[snapshots] Verify start")
+	d.logger.Info("[snapshots] Verify start ====================== ")
+	fmt.Printf("Stack trace:\n%s\n", debug.Stack())
 	defer d.logger.Info("[snapshots] Verify done", "files", len(toVerify), "whiteList", whiteList)
 
 	completedPieces, completedFiles := &atomic.Uint64{}, &atomic.Uint64{}
@@ -2404,7 +2406,8 @@ func (d *Downloader) VerifyData(ctx context.Context, whiteList []string, failFas
 	g, context := errgroup.WithContext(ctx)
 	// torrent lib internally limiting amount of hashers per file
 	// set limit here just to make load predictable, not to control Disk/CPU consumption
-	g.SetLimit(runtime.GOMAXPROCS(-1) * 4)
+	g.SetLimit(1)
+	// g.SetLimit(runtime.GOMAXPROCS(-1) * 4)
 	for _, t := range toVerify {
 		t := t
 		g.Go(func() error {

@@ -413,10 +413,13 @@ func WaitForDownloader(ctx context.Context, logPrefix string, dirs datadir.Dirs,
 		}
 	}
 
-	if blockReader.FreezingCfg().Verify {
-		if _, err := snapshotDownloader.Verify(ctx, &proto_downloader.VerifyRequest{}); err != nil {
-			return err
+	if !headerchain {
+		if blockReader.FreezingCfg().Verify {
+			if _, err := snapshotDownloader.Verify(ctx, &proto_downloader.VerifyRequest{}); err != nil {
+				return err
+			}
 		}
+		
 	}
 
 	if err := snapshots.OpenFolder(); err != nil {
