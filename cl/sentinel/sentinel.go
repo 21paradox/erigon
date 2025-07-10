@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -294,28 +295,46 @@ func (s *Sentinel) observeBandwidth(ctx context.Context) {
 			totals := s.bwc.GetBandwidthTotals()
 			monitor.ObserveTotalInBytes(totals.TotalIn)
 			monitor.ObserveTotalOutBytes(totals.TotalOut)
-			minBound := datasize.KB
+			// minBound := datasize.KB
 			// define rate cap
-			maxRateIn := float64(max(s.cfg.MaxInboundTrafficPerPeer, minBound)) * multiplierForAdaptableTraffic
-			maxRateOut := float64(max(s.cfg.MaxOutboundTrafficPerPeer, minBound)) * multiplierForAdaptableTraffic
+			// maxRateIn := float64(max(s.cfg.MaxInboundTrafficPerPeer, minBound)) * multiplierForAdaptableTraffic
+			// maxRateOut := float64(max(s.cfg.MaxOutboundTrafficPerPeer, minBound)) * multiplierForAdaptableTraffic
 			peers := s.host.Network().Peers()
-			maxPeersToBan := 16
+			maxPeersToBan := 10
 			// do not ban peers if we have less than 1/8 of max peer count
 			if len(peers) <= maxPeersToBan {
 				continue
 			}
-			maxPeersToBan = min(maxPeersToBan, len(peers)-maxPeersToBan)
+			maxPeersToBan = min(maxPeersToBan, len(peers)/8)
 
 			peersToBan := make([]peer.ID, 0, len(peers))
 			// Check which peers should be banned
-			for _, p := range peers {
-				// get peer bandwidth
+
+			sortedPeers := make([]peer.ID, len(peers))
+			copy(sortedPeers, peers)
+			sort.Slice(sortedPeers, func(i, j int) bool {
+				bandwith_i := s.bwc.GetBandwidthForPeer(sortedPeers[i])
+				bandwidh_j := s.bwc.GetBandwidthForPeer(sortedPeers[j])
+				return bandwith_i.RateIn < bandwidh_j.RateIn
+			})
+			peers_min_5 := peers[0:max(3, len(peers))]
+			min_accept_band := float64(15*datasize.KB) * multiplierForAdaptableTraffic
+
+			for _, p := range peers_min_5 {
 				peerBandwidth := s.bwc.GetBandwidthForPeer(p)
-				// check if peer is over limit
-				if peerBandwidth.RateIn > maxRateIn || peerBandwidth.RateOut > maxRateOut {
+				if peerBandwidth.RateIn < min_accept_band {
 					peersToBan = append(peersToBan, p)
 				}
 			}
+
+			// for _, p := range peers {
+			// 	// get peer bandwidth
+			// 	peerBandwidth := s.bwc.GetBandwidthForPeer(p)
+			// 	// check if peer is over limit
+			// 	if peerBandwidth.RateOut > maxRateOut {
+			// 		peersToBan = append(peersToBan, p)
+			// 	}
+			// }
 			// if we have more than 1/8 of max peer count to ban, limit to maxPeersToBan
 			if len(peersToBan) > maxPeersToBan {
 				peersToBan = peersToBan[:maxPeersToBan]

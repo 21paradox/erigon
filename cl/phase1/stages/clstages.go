@@ -142,6 +142,19 @@ func MetaCatchingUp(args Args) StageName {
 
 	return ""
 }
+func MetaCatchingUpFoward(args Args) StageName {
+	if !args.hasDownloaded {
+		return DownloadHistoricalBlocks
+	}
+	if args.seenEpoch < args.targetEpoch-12 {
+		return ForwardSync
+	}
+	if args.seenSlot < args.targetSlot {
+		return ChainTipSync
+	}
+
+	return ""
+}
 
 func processBlock(ctx context.Context, cfg *Cfg, db kv.RwDB, block *cltypes.SignedBeaconBlock, newPayload, fullValidation, checkDataAvaiability bool) error {
 	if err := db.Update(ctx, func(tx kv.RwTx) error {
@@ -260,7 +273,7 @@ func ConsensusClStages(ctx context.Context,
 			ForwardSync: {
 				Description: `if we are 1 or more epochs behind, we download in parallel by epoch`,
 				TransitionFunc: func(cfg *Cfg, args Args, err error) string {
-					if x := MetaCatchingUp(args); x != "" {
+					if x := MetaCatchingUpFoward(args); x != "" {
 						return x
 					}
 					return ChainTipSync

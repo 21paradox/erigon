@@ -18,7 +18,7 @@ package network
 
 import (
 	"errors"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	"golang.org/x/net/context"
@@ -28,9 +28,10 @@ import (
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/rpc"
+	"github.com/erigontech/erigon/cl/sentinel/peers"
 )
 
-var requestBlobBatchExpiration = 15 * time.Second
+var requestBlobBatchExpiration = 45 * time.Second
 
 // This is just a bunch of functions to handle blobs
 
@@ -88,52 +89,80 @@ type PeerAndSidecars struct {
 	Responses []*cltypes.BlobSidecar
 }
 
-// RequestBlobsFrantically requests blobs from the network frantically.
-func RequestBlobsFrantically(ctx context.Context, r *rpc.BeaconRpcP2P, req *solid.ListSSZ[*cltypes.BlobIdentifier]) (*PeerAndSidecars, error) {
-	var atomicResp atomic.Value
+func RequestBlobsFrantically(ctx context.Context, r *rpc.BeaconRpcP2P, req *solid.ListSSZ[*cltypes.BlobIdentifier]) (chan PeerAndSidecars, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
 
-	atomicResp.Store(&PeerAndSidecars{})
-	timer := time.NewTimer(requestBlobBatchExpiration)
-	defer timer.Stop()
-	reqInterval := time.NewTicker(100 * time.Millisecond)
-	defer reqInterval.Stop()
-Loop:
-	for {
-		select {
-		case <-reqInterval.C:
-			go func() {
-				if len(atomicResp.Load().(*PeerAndSidecars).Responses) > 0 {
-					return
-				}
-				// this is so we do not get stuck on a side-fork
-				responses, pid, err := r.SendBlobsSidecarByIdentifierReq(ctx, req)
-				if err != nil {
-					log.Trace("RequestBlobsFrantically: error", "err", err, "peer", pid)
-					return
-				}
-				if responses == nil {
-					log.Trace("RequestBlobsFrantically: response is nil", "peer", pid)
-					return
-				}
-				if len(atomicResp.Load().(*PeerAndSidecars).Responses) > 0 {
-					return
-				}
-				atomicResp.Store(&PeerAndSidecars{
-					Peer:      pid,
-					Responses: responses,
-				})
-			}()
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			log.Trace("RequestBlobsFrantically: timeout")
-			return nil, errors.New("timeout")
-		default:
-			if len(atomicResp.Load().(*PeerAndSidecars).Responses) > 0 {
-				break Loop
-			}
-			time.Sleep(10 * time.Millisecond)
+	respChan := make(chan PeerAndSidecars, 50)
+	nopeersErrChan := make(chan error, 50)
+
+	var requestFn = func(ctx context.Context, loopCount int, countStart int) {}
+	requestFn = func(ctx context.Context, loopCount int, countStart int) {
+		if loopCount > 2 {
+			return
 		}
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		responses, pid, err := r.SendBlobsSidecarByIdentifierReq(ctx, req)
+
+		if err != nil {
+			log.Warn("LoopingRequestBlobs: error", "err", err, "peer", pid, "size", req.Len(), "loopCount", loopCount, "countstart", countStart)
+			needRetry := true
+			if strings.Contains(err.Error(), "deadline exceeded") {
+				r.BanPeer(pid)
+			}
+			if strings.Contains(err.Error(), "no addresses") {
+				// needRetry = false
+				r.BanPeer(pid)
+			}
+			if strings.Contains(err.Error(), "peer error code: 1") {
+				r.BanPeer(pid)
+			}
+			if errors.Is(err, peers.ErrNoPeers) {
+				log.Warn("LoopingRequestBlobs: No peers available")
+				nopeersErrChan <- err
+				needRetry = false
+			}
+			if needRetry {
+				go requestFn(ctx, loopCount+1, countStart)
+			}
+			return
+		}
+		if responses == nil {
+			log.Warn("LoopingRequestBlobs: response is nil", "peer", pid)
+			return
+		}
+		if len(responses) == 0 {
+			return
+		}
+		resp := PeerAndSidecars{
+			Peer:      pid,
+			Responses: responses,
+		}
+		respChan <- resp
 	}
-	return atomicResp.Load().(*PeerAndSidecars), nil
+
+	go func() {
+		go requestFn(ctx, 0, 0)
+		delay := time.Duration(300 * time.Millisecond)
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-nopeersErrChan:
+				for len(nopeersErrChan) > 0 {
+					<-nopeersErrChan
+				}
+				delay = time.Duration(5000 * time.Millisecond)
+			case <-time.After(delay):
+				go requestFn(ctx, 0, i)
+				delay = time.Duration(300 * time.Millisecond)
+			}
+		}
+	}()
+
+	return respChan, cancel
 }

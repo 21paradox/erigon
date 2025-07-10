@@ -19,6 +19,7 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice"
 	network2 "github.com/erigontech/erigon/cl/phase1/network"
+	"golang.org/x/sync/errgroup"
 )
 
 // shouldProcessBlobs checks if any block in the given list of blocks
@@ -57,48 +58,100 @@ func shouldProcessBlobs(blocks []*cltypes.SignedBeaconBlock, cfg *Cfg) bool {
 // It takes highest slot processed, and a list of signed beacon blocks as input.
 // It returns the highest blob slot processed and an error if any.
 func downloadAndProcessEip4844DA(ctx context.Context, logger log.Logger, cfg *Cfg, highestSlotProcessed uint64, blocks []*cltypes.SignedBeaconBlock) (highestBlobSlotProcessed uint64, err error) {
-	var (
-		ids   *solid.ListSSZ[*cltypes.BlobIdentifier]
-		blobs *network2.PeerAndSidecars
-	)
+	allIds := []*solid.ListSSZ[*cltypes.BlobIdentifier]{}
 
-	// Retrieve blob identifiers from the given blocks
-	ids, err = network2.BlobsIdentifiersFromBlocks(blocks, cfg.beaconCfg)
-	if err != nil {
-		// Return an error if blob identifiers could not be retrieved
-		err = fmt.Errorf("failed to get blob identifiers: %w", err)
+	const chunkSize = 24
+	bindex := 0
+
+	for i := bindex + 1; i <= len(blocks); i += 1 {
+		blocksToProcess := blocks[bindex:i]
+		subids, err1 := network2.BlobsIdentifiersFromBlocks(blocksToProcess, cfg.beaconCfg)
+		if err1 != nil {
+			err = fmt.Errorf("failed to get blob identifiers: %w", err1)
+			return
+		}
+
+		if subids.Len() >= chunkSize {
+			allIds = append(allIds, subids)
+			bindex = i
+		}
+	}
+
+	blocksToProcess := blocks[bindex:]
+	subids, err2 := network2.BlobsIdentifiersFromBlocks(blocksToProcess, cfg.beaconCfg)
+	if err2 != nil {
+		err = fmt.Errorf("failed to get blob identifiers: %w", err2)
 		return
 	}
+	allIds = append(allIds, subids)
 
-	// If there are no blobs to retrieve, return the highest slot processed
-	if ids.Len() == 0 {
-		return highestSlotProcessed, nil
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(1)
+	hprocessedChan := make(chan uint64)
+
+	highestSlotProcessedNow := highestSlotProcessed
+	go func() {
+		for hprocess := range hprocessedChan {
+			if hprocess > highestSlotProcessedNow {
+				highestSlotProcessedNow = hprocess
+			}
+		}
+	}()
+
+	for _, ids := range allIds {
+		if ids.Len() == 0 {
+			continue
+		}
+		ids := ids
+
+		processIDs := func() error {
+			respChan, cancel := network2.RequestBlobsFrantically(ctx, cfg.rpc, ids)
+
+		Loop:
+			for i := 0; ; {
+				select {
+				case <-egCtx.Done():
+					cancel()
+					return egCtx.Err()
+				case blobs := <-respChan:
+					i += 1
+					// Verify the blobs against identifiers and insert them into the blob store
+					hprocessed, inserted, err := blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStore, ids, blobs.Responses, nil)
+					log.Warn("inserted equal check in forward", "ids.len", ids.Len(), "inserted", inserted)
+
+					if err == nil && inserted == uint64(ids.Len()) {
+						hprocessedChan <- hprocessed
+						cancel()
+						break Loop
+					} else {
+						if err != nil {
+							cfg.rpc.BanPeer(blobs.Peer)
+						} else {
+							if hprocessed > 0 {
+								hprocessedChan <- hprocessed - 1
+							}
+						}
+						if i > 3 && err != nil {
+							cancel()
+							err = fmt.Errorf("failed to verify blobs: %w", err)
+							break Loop
+						}
+					}
+				}
+			}
+			return nil
+		}
+		eg.Go(processIDs)
 	}
 
-	// Request blobs from the network
-	blobs, err = network2.RequestBlobsFrantically(ctx, cfg.rpc, ids)
-	if err != nil {
-		// Return an error if blobs could not be retrieved
-		err = fmt.Errorf("failed to get blobs: %w", err)
-		return
+	errinGroup := eg.Wait()
+	close(hprocessedChan)
+
+	if errinGroup != nil {
+		return highestSlotProcessedNow, errinGroup
 	}
 
-	var highestProcessed, inserted uint64
-	// Verify and insert blobs into the blob store
-	if highestProcessed, inserted, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStore, ids, blobs.Responses, nil); err != nil {
-		// Ban the peer if verification fails
-		cfg.rpc.BanPeer(blobs.Peer)
-		// Return an error if blobs could not be verified
-		err = fmt.Errorf("failed to verify blobs: %w", err)
-		return
-	}
-	// If all blobs were inserted successfully, return the highest processed slot
-	if inserted == uint64(ids.Len()) {
-		return highestProcessed, nil
-	}
-
-	// If not all blobs were inserted, return the highest processed slot minus one
-	return highestProcessed - 1, err
+	return highestSlotProcessedNow, nil
 }
 
 // processDownloadedBlockBatches processes a batch of downloaded blocks.

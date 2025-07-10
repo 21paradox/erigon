@@ -416,29 +416,48 @@ func downloadBlobHistoryWorker(cfg StageHistoryReconstructionCfg, ctx context.Co
 			continue
 		}
 		// Request the blobs
-		blobs, err := network.RequestBlobsFrantically(ctx, rpc, req)
-		if err != nil {
-			cfg.logger.Debug("Error requesting blobs", "err", err)
-			continue
-		}
-		_, _, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStorage, req, blobs.Responses, func(header *cltypes.SignedBeaconBlockHeader) error {
-			// The block is preverified so just check that the signature is correct against the block
-			for _, block := range batch {
-				if block.Block.Slot != header.Header.Slot {
-					continue
+		// blobs, err := network.RequestBlobsFrantically(ctx, rpc, req)
+		if req.Len() > 0 {
+			respChan, cancel := network.RequestBlobsFrantically(ctx, rpc, req)
+			var blobs network.PeerAndSidecars
+
+		Loop:
+			for {
+				select {
+				case <-ctx.Done():
+					cancel()
+					break Loop
+				case blobs1 := <-respChan:
+					blobs = blobs1
+					cancel()
+					break Loop
 				}
-				if block.Signature != header.Signature {
-					return errors.New("signature mismatch between blob and stored block")
-				}
-				return nil
 			}
-			return errors.New("block not in batch")
-		})
-		if err != nil {
-			rpc.BanPeer(blobs.Peer)
-			cfg.logger.Warn("Error verifying blobs", "err", err)
-			continue
+
+			// if err != nil {
+			// 	cfg.logger.Debug("Error requesting blobs", "err", err)
+			// 	continue
+			// }
+			_, _, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStorage, req, blobs.Responses, func(header *cltypes.SignedBeaconBlockHeader) error {
+				// The block is preverified so just check that the signature is correct against the block
+				for _, block := range batch {
+					if block.Block.Slot != header.Header.Slot {
+						continue
+					}
+					if block.Signature != header.Signature {
+						return errors.New("signature mismatch between blob and stored block")
+					}
+					return nil
+				}
+				return errors.New("block not in batch")
+			})
+			if err != nil {
+				rpc.BanPeer(blobs.Peer)
+				cfg.logger.Warn("Error verifying blobs", "err", err)
+				continue
+			}
 		}
+
 	}
 	if shouldLog {
 		logger.Info("[Blobs-Downloader] Blob history download finished successfully")

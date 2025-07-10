@@ -7,10 +7,12 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cl/cltypes"
+	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/persistence/blob_storage"
 	network2 "github.com/erigontech/erigon/cl/phase1/network"
 	"github.com/erigontech/erigon/cl/sentinel/peers"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 // waitForExecutionEngineToBeFinished checks if the execution engine is ready within a specified timeout.
@@ -71,32 +73,86 @@ func fetchBlocksFromReqResp(ctx context.Context, cfg *Cfg, from uint64, count ui
 	}
 
 	// Generate blob identifiers from the retrieved blocks
-	ids, err := network2.BlobsIdentifiersFromBlocks(blocks, cfg.beaconCfg)
+	// ids, err := network2.BlobsIdentifiersFromBlocks(blocks, cfg.beaconCfg)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	allIds := []*solid.ListSSZ[*cltypes.BlobIdentifier]{}
+
+	const chunkSize = 24
+	bindex := 0
+
+	for i := bindex + 1; i <= len(blocks); i += 1 {
+		blocksToProcess := blocks[bindex:i]
+		subids, err := network2.BlobsIdentifiersFromBlocks(blocksToProcess, cfg.beaconCfg)
+		if err != nil {
+			return nil, err
+		}
+
+		if subids.Len() >= chunkSize {
+			allIds = append(allIds, subids)
+			bindex = i
+		}
+	}
+
+	blocksToProcess := blocks[bindex:]
+	subids, err := network2.BlobsIdentifiersFromBlocks(blocksToProcess, cfg.beaconCfg)
 	if err != nil {
 		return nil, err
 	}
+	allIds = append(allIds, subids)
 
-	var inserted uint64
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(2)
 
 	// Loop until all blobs are inserted into the blob store
-	for inserted != uint64(ids.Len()) {
-		select {
-		case <-ctx.Done():
-			// Context canceled or timed out
-			return nil, ctx.Err()
-		default:
-		}
+	// for inserted != uint64(ids.Len()) {
+	select {
+	case <-ctx.Done():
+		// Context canceled or timed out
+		return nil, ctx.Err()
+	default:
+	}
 
-		// Request blobs frantically from the execution client
-		blobs, err := network2.RequestBlobsFrantically(ctx, cfg.rpc, ids)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to request blobs frantically")
+	for _, ids := range allIds {
+		if ids.Len() == 0 {
+			continue
 		}
+		ids := ids
 
-		// Verify the blobs against identifiers and insert them into the blob store
-		if _, inserted, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStore, ids, blobs.Responses, nil); err != nil {
-			return nil, errors.Wrap(err, "failed to verify blobs against identifiers and insert into the blob store")
+		processIDs := func() error {
+			respChan, cancel := network2.RequestBlobsFrantically(ctx, cfg.rpc, ids)
+
+		Loop:
+			for i := 0; ; i++ {
+				select {
+				case <-egCtx.Done():
+					cancel()
+					return egCtx.Err()
+				case blobs := <-respChan:
+					i += 1
+					var inserted uint64
+					// Verify the blobs against identifiers and insert them into the blob store
+					_, inserted, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStore, ids, blobs.Responses, nil)
+					log.Warn("inserted equal check", "ids.len", ids.Len(), "inserted", inserted)
+					if err == nil && inserted == uint64(ids.Len()) {
+						cancel()
+						break Loop
+					} else {
+						if err != nil && i > 3 {
+							cancel()
+							return errors.Wrap(err, "failed to verify blobs against identifiers and insert into the blob store")
+						}
+					}
+				}
+			}
+			return nil
 		}
+		eg.Go(processIDs)
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
 
 	// Return the blocks and the peer ID wrapped in a PeeredObject
@@ -110,10 +166,12 @@ func fetchBlocksFromReqResp(ctx context.Context, cfg *Cfg, from uint64, count ui
 // It periodically fetches blocks from the highest seen block up to the current slot and sends the results or errors to the provided channels.
 func startFetchingBlocksMissedByGossipAfterSomeTime(ctx context.Context, cfg *Cfg, args Args, respCh chan<- *peers.PeeredObject[[]*cltypes.SignedBeaconBlock], errCh chan error) {
 	// Wait for half the duration of SecondsPerSlot or until the context is done
-	select {
-	case <-time.After((time.Duration(cfg.beaconCfg.SecondsPerSlot) * time.Second) / 2):
-	case <-ctx.Done():
-		return
+	if cfg.forkChoice.HighestSeen()-2 <= cfg.ethClock.GetCurrentSlot() {
+		select {
+		case <-time.After((time.Duration(cfg.beaconCfg.SecondsPerSlot) * time.Second) / 2):
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	// Continuously fetch and process blocks
@@ -134,6 +192,9 @@ func startFetchingBlocksMissedByGossipAfterSomeTime(ctx context.Context, cfg *Cf
 			// Send error to the error channel and return
 			errCh <- err
 			return
+		}
+		if blocks == nil {
+			continue
 		}
 
 		// Send fetched blocks to the response channel or handle context cancellation
@@ -249,7 +310,7 @@ func chainTipSync(ctx context.Context, logger log.Logger, cfg *Cfg, args Args) e
 	errCh := make(chan error)
 
 	// 25 seconds is a good timeout for this
-	ctx, cn := context.WithTimeout(ctx, 25*time.Second)
+	ctx, cn := context.WithTimeout(ctx, 900*time.Second)
 	defer cn()
 
 	go startFetchingBlocksMissedByGossipAfterSomeTime(ctx, cfg, args, respCh, errCh)

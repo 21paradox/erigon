@@ -73,7 +73,7 @@ func (b *BeaconRpcP2P) sendBlocksRequest(ctx context.Context, topic string, reqD
 	// Prepare output slice.
 	responsePacket := []*cltypes.SignedBeaconBlock{}
 
-	ctx, cn := context.WithTimeout(ctx, time.Second*2)
+	ctx, cn := context.WithTimeout(ctx, time.Second*30)
 	defer cn()
 	message, err := b.sentinel.SendRequest(ctx, &sentinel.RequestData{
 		Data:  reqData,
@@ -147,7 +147,7 @@ func (b *BeaconRpcP2P) sendBlobsSidecar(ctx context.Context, topic string, reqDa
 	// Prepare output slice.
 	responsePacket := []*cltypes.BlobSidecar{}
 
-	ctx, cn := context.WithTimeout(ctx, time.Second*2)
+	ctx, cn := context.WithTimeout(ctx, time.Second*60)
 	defer cn()
 	message, err := b.sentinel.SendRequest(ctx, &sentinel.RequestData{
 		Data:  reqData,
