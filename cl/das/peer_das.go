@@ -8,6 +8,7 @@ import (
 	"time"
 
 	goethkzg "github.com/crate-crypto/go-eth-kzg"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -17,6 +18,7 @@ import (
 	"github.com/erigontech/erigon/cl/gossip"
 	"github.com/erigontech/erigon/cl/persistence/blob_storage"
 	"github.com/erigontech/erigon/cl/rpc"
+	"github.com/erigontech/erigon/cl/sentinel/peers"
 	"github.com/erigontech/erigon/cl/utils/eth_clock"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto/kzg"
@@ -530,27 +532,29 @@ func (d *peerdas) DownloadColumnsAndRecoverBlobs(ctx context.Context, blocks []*
 		for _, block := range blocks {
 			slots = append(slots, block.Block.Slot)
 		}
-		log.Debug("DownloadColumnsAndRecoverBlobs", "elapsed time", time.Since(begin), "slots", slots)
+		log.Warn("DownloadColumnsAndRecoverBlobs", "elapsed time", time.Since(begin), "slots", slots, "blocksToProcess", blocksToProcess)
 	}()
-
 	// initialize the download request
-	batchBlcokSize := 4
-	wg := sync.WaitGroup{}
+	batchBlcokSize := 1
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(4)
+
 	for i := 0; i < len(blocksToProcess); i += batchBlcokSize {
 		blocks := blocksToProcess[i:min(i+batchBlcokSize, len(blocksToProcess))]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+
+		eg.Go(func() error {
 			req, err := initializeDownloadRequest(blocks, d.beaconConfig, d.columnStorage, allColumns)
 			if err != nil {
 				log.Warn("failed to initialize download request", "err", err)
-				return
+				return err
 			}
-			d.runDownload(ctx, req, true)
-		}()
+			d.runDownload(egCtx, req, true)
+			return nil
+		})
 	}
-	wg.Wait()
-	return nil
+
+	errinGroup := eg.Wait()
+	return errinGroup
 }
 
 func (d *peerdas) runDownload(ctx context.Context, req *downloadRequest, needToRecoverBlobs bool) error {
@@ -563,52 +567,69 @@ func (d *peerdas) runDownload(ctx context.Context, req *downloadRequest, needToR
 	if len(req.remainingEntries()) == 0 {
 		return nil
 	}
+	nopeersErrChan := make(chan error, 5)
 
-	stopChan := make(chan struct{})
-	defer close(stopChan)
 	resultChan := make(chan resultData, 64)
+	cctx, cancel_cctx := context.WithCancel(ctx)
+	defer cancel_cctx()
+
 	go func(req *downloadRequest) {
 		// send the request in a loop with a ticker to avoid overwhelming the peer
 		// keep trying until the request is done
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		wg := sync.WaitGroup{}
+		sendReq := func() {
+			select {
+			case <-cctx.Done():
+				return
+			default:
+			}
+			ids := req.requestData()
+			if ids.Len() == 0 {
+				cancel_cctx()
+				return
+			}
+			reqLength := 0
+			ids.Range(func(_ int, id *cltypes.DataColumnsByRootIdentifier, length int) bool {
+				reqLength += id.Columns.Length()
+				return true
+			})
+			s, pid, err := d.rpc.SendColumnSidecarsByRootIdentifierReq(cctx, ids)
+			if err == nil {
+				select {
+				case resultChan <- resultData{
+					sidecars:  s,
+					pid:       pid,
+					reqLength: reqLength,
+					err:       err,
+				}:
+				default:
+					// just drop it if the channel is full
+				}
+			} else {
+				if errors.Is(err, peers.ErrNoPeers) || errors.Is(err, peers.PeerRecover) {
+					log.Warn("No peers available for sendReq in das", "err", err, "pid", pid, "reqLen", reqLength)
+					nopeersErrChan <- err
+				} else {
+					log.Warn("err sendReq in das", "err", err, "pid", pid, "reqLen", reqLength)
+				}
+			}
+		}
+		go sendReq()
+
 	loop:
 		for {
 			select {
-			case <-stopChan:
+			case <-cctx.Done():
 				break loop
-			case <-ticker.C:
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-					defer cancel()
-					ids := req.requestData()
-					if ids.Len() == 0 {
-						return
-					}
-					reqLength := 0
-					ids.Range(func(_ int, id *cltypes.DataColumnsByRootIdentifier, length int) bool {
-						reqLength += id.Columns.Length()
-						return true
-					})
-					s, pid, err := d.rpc.SendColumnSidecarsByRootIdentifierReq(cctx, ids)
-					select {
-					case resultChan <- resultData{
-						sidecars:  s,
-						pid:       pid,
-						reqLength: reqLength,
-						err:       err,
-					}:
-					default:
-						// just drop it if the channel is full
-					}
-				}()
+			case <-nopeersErrChan:
+				for len(nopeersErrChan) > 0 {
+					<-nopeersErrChan
+				}
+				time.Sleep(3 * time.Second)
+				sendReq() //sync request
+			case <-time.After(2500 * time.Millisecond):
+				go sendReq()
 			}
 		}
-		wg.Wait()
-		close(resultChan)
 	}(req)
 
 	// check if the column data is over half at the same time because we might also receive the column sidecars from other peers
@@ -617,6 +638,8 @@ func (d *peerdas) runDownload(ctx context.Context, req *downloadRequest, needToR
 mainloop:
 	for {
 		select {
+		case <-cctx.Done():
+			break mainloop
 		case <-ctx.Done():
 			break mainloop
 		case <-halfCheckTicker.C:
@@ -629,7 +652,7 @@ mainloop:
 				} else {
 					available, err := d.isMyColumnDataAvailable(entry.slot, entry.blockRoot)
 					if err != nil {
-						log.Debug("failed to check if column data is available", "err", err)
+						log.Warn("failed to check if column data is available", "err", err)
 						continue
 					}
 					if available {
@@ -642,23 +665,23 @@ mainloop:
 			}
 		case result := <-resultChan:
 			if result.err != nil {
-				log.Debug("failed to download columns from peer", "pid", result.pid, "err", result.err)
+				log.Warn("failed to download columns from peer", "pid", result.pid, "err", result.err)
 				//d.rpc.BanPeer(result.pid)
 				continue
 			}
 			if len(result.sidecars) == 0 {
 				continue
 			}
-			log.Debug("received column sidecars", "pid", result.pid, "reqLength", result.reqLength, "count", len(result.sidecars))
-			wg := sync.WaitGroup{}
+			log.Warn("received column sidecars", "pid", result.pid, "reqLength", result.reqLength, "count", len(result.sidecars))
+			// wg := sync.WaitGroup{}
 			for _, sidecar := range result.sidecars {
-				wg.Add(1)
-				go func(sidecar *cltypes.DataColumnSidecar) {
-					defer wg.Done()
+				// wg.Add(1)
+				func(sidecar *cltypes.DataColumnSidecar) {
+					// defer wg.Done()
 					blockRoot, err := sidecar.SignedBlockHeader.Header.HashSSZ()
 					if err != nil {
-						log.Debug("failed to get block root", "err", err)
-						d.rpc.BanPeer(result.pid)
+						log.Warn("failed to get block root", "err", err)
+						// d.rpc.BanPeer(result.pid)
 						return
 					}
 					slot := sidecar.SignedBlockHeader.Header.Slot
@@ -675,7 +698,7 @@ mainloop:
 					columnData := sidecar
 					exist, err := d.columnStorage.ColumnSidecarExists(ctx, sidecar.SignedBlockHeader.Header.Slot, blockRoot, int64(columnIndex))
 					if err != nil {
-						log.Debug("failed to check if column sidecar exists", "err", err)
+						log.Warn("failed to check if column sidecar exists", "err", err)
 						d.rpc.BanPeer(result.pid)
 						return
 					}
@@ -691,34 +714,34 @@ mainloop:
 					}
 
 					if !VerifyDataColumnSidecar(sidecar) {
-						log.Debug("failed to verify column sidecar", "blockRoot", blockRoot, "columnIndex", sidecar.Index)
+						log.Warn("failed to verify column sidecar", "blockRoot", blockRoot, "columnIndex", sidecar.Index)
 						d.rpc.BanPeer(result.pid)
 						return
 					}
 					if !VerifyDataColumnSidecarInclusionProof(sidecar) {
-						log.Debug("failed to verify column sidecar inclusion proof", "blockRoot", blockRoot, "columnIndex", sidecar.Index)
+						log.Warn("failed to verify column sidecar inclusion proof", "blockRoot", blockRoot, "columnIndex", sidecar.Index)
 						d.rpc.BanPeer(result.pid)
 						return
 					}
 					if !VerifyDataColumnSidecarKZGProofs(sidecar) {
-						log.Debug("failed to verify column sidecar kzg proofs", "blockRoot", blockRoot, "columnIndex", sidecar.Index)
+						log.Warn("failed to verify column sidecar kzg proofs", "blockRoot", blockRoot, "columnIndex", sidecar.Index)
 						d.rpc.BanPeer(result.pid)
 						return
 					}
 					// save the sidecar to the column storage
 					if err := d.columnStorage.WriteColumnSidecars(ctx, blockRoot, int64(columnIndex), columnData); err != nil {
-						log.Debug("failed to write column sidecar", "err", err)
+						log.Warn("failed to write column sidecar", "err", err)
 						return
 					}
 					// done. remove the column from the download table
 					req.removeColumn(slot, blockRoot, columnIndex)
 				}(sidecar)
 			}
-			wg.Wait()
+			// wg.Wait()
 			// check if there are any remaining requests and send again if there are
-			if req.requestData().Len() == 0 {
-				break mainloop
-			}
+			// if req.requestData().Len() == 0 {
+			// 	break mainloop
+			// }
 		}
 	}
 
@@ -748,6 +771,10 @@ func initializeDownloadRequest(
 	downloadTable := make(map[downloadTableEntry]map[uint64]bool)
 	blockRootToBeaconBlock := make(map[common.Hash]*cltypes.SignedBlindedBeaconBlock)
 	for _, block := range blocks {
+		if block == nil { // 加这一行
+			log.Warn("initializeDownloadRequest nil block", "block", block)
+			continue
+		}
 		if block.Version() < clparams.FuluVersion {
 			continue
 		}

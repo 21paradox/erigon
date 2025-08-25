@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	"github.com/c2h5oh/datasize"
 	"github.com/golang/snappy"
@@ -118,10 +117,10 @@ func (b *BeaconRpcP2P) SendColumnSidecarsByRootIdentifierReq(
 	ctx context.Context,
 	req *solid.ListSSZ[*cltypes.DataColumnsByRootIdentifier],
 ) ([]*cltypes.DataColumnSidecar, string, error) {
-	_, pid, _, err := b.columnDataPeers.pickPeerRoundRobin(ctx, req)
-	if err != nil {
-		return nil, pid, err
-	}
+	// _, pid, _, err := b.columnDataPeers.pickPeerRoundRobin(ctx, req)
+	// if err != nil {
+	// 	return nil, pid, err
+	// }
 
 	var buffer buffer.Buffer
 	if err := ssz_snappy.EncodeAndWrite(&buffer, req); err != nil {
@@ -129,7 +128,7 @@ func (b *BeaconRpcP2P) SendColumnSidecarsByRootIdentifierReq(
 	}
 
 	data := buffer.Bytes()
-	responsePacket, pid, err := b.sendRequestWithPeer(ctx, communication.DataColumnSidecarsByRootProtocolV1, data, pid)
+	responsePacket, pid, err := b.sendRequest(ctx, communication.DataColumnSidecarsByRootProtocolV1, data)
 	if err != nil {
 		return nil, pid, err
 	}
@@ -351,8 +350,8 @@ func (b *BeaconRpcP2P) sendRequest(
 	topic string,
 	reqPayload []byte,
 ) ([]responseData, string, error) {
-	ctx, cn := context.WithTimeout(ctx, time.Second*2)
-	defer cn()
+	// ctx, cn := context.WithTimeout(ctx, time.Second*60)
+	// defer cn()
 	message, err := b.sentinel.SendRequest(ctx, &sentinelproto.RequestData{
 		Data:  reqPayload,
 		Topic: topic,
@@ -363,21 +362,21 @@ func (b *BeaconRpcP2P) sendRequest(
 	return b.parseResponseData(message)
 }
 
-func (b *BeaconRpcP2P) sendRequestWithPeer(
-	ctx context.Context,
-	topic string,
-	reqPayload []byte,
-	peerId string,
-) ([]responseData, string, error) {
-	ctx, cn := context.WithTimeout(ctx, time.Second*2)
-	defer cn()
-	message, err := b.sentinel.SendPeerRequest(ctx, &sentinelproto.RequestDataWithPeer{
-		Pid:   peerId,
-		Data:  reqPayload,
-		Topic: topic,
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	return b.parseResponseData(message)
-}
+// func (b *BeaconRpcP2P) sendRequestWithPeer(
+// 	ctx context.Context,
+// 	topic string,
+// 	reqPayload []byte,
+// 	peerId string,
+// ) ([]responseData, string, error) {
+// 	// ctx, cn := context.WithTimeout(ctx, time.Second*60)
+// 	// defer cn()
+// 	message, err := b.sentinel.SendPeerRequest(ctx, &sentinelproto.RequestDataWithPeer{
+// 		Pid:   peerId,
+// 		Data:  reqPayload,
+// 		Topic: topic,
+// 	})
+// 	if err != nil {
+// 		return nil, "", err
+// 	}
+// 	return b.parseResponseData(message)
+// }
