@@ -18,7 +18,7 @@ package network
 
 import (
 	"errors"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	"golang.org/x/net/context"
@@ -28,6 +28,7 @@ import (
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/rpc"
+	"github.com/erigontech/erigon/cl/sentinel/peers"
 )
 
 var ErrTimeout = errors.New("timeout")
@@ -90,52 +91,97 @@ type PeerAndSidecars struct {
 	Responses []*cltypes.BlobSidecar
 }
 
-// RequestBlobsFrantically requests blobs from the network frantically.
-func RequestBlobsFrantically(ctx context.Context, r *rpc.BeaconRpcP2P, req *solid.ListSSZ[*cltypes.BlobIdentifier]) (*PeerAndSidecars, error) {
-	var atomicResp atomic.Value
+func RequestBlobsFrantically(ctx context.Context, r *rpc.BeaconRpcP2P, req *solid.ListSSZ[*cltypes.BlobIdentifier]) (chan PeerAndSidecars, chan error, context.CancelFunc) {
+	ctx1, cancel := context.WithCancel(ctx)
 
-	atomicResp.Store(&PeerAndSidecars{})
-	timer := time.NewTimer(requestBlobBatchExpiration)
-	defer timer.Stop()
-	reqInterval := time.NewTicker(100 * time.Millisecond)
-	defer reqInterval.Stop()
-Loop:
-	for {
-		select {
-		case <-reqInterval.C:
-			go func() {
-				if len(atomicResp.Load().(*PeerAndSidecars).Responses) > 0 {
-					return
-				}
-				// this is so we do not get stuck on a side-fork
-				responses, pid, err := r.SendBlobsSidecarByIdentifierReq(ctx, req)
-				if err != nil {
-					log.Trace("RequestBlobsFrantically: error", "err", err, "peer", pid)
-					return
-				}
-				if responses == nil {
-					log.Trace("RequestBlobsFrantically: response is nil", "peer", pid)
-					return
-				}
-				if len(atomicResp.Load().(*PeerAndSidecars).Responses) > 0 {
-					return
-				}
-				atomicResp.Store(&PeerAndSidecars{
-					Peer:      pid,
-					Responses: responses,
-				})
-			}()
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			log.Trace("RequestBlobsFrantically: timeout")
-			return nil, ErrTimeout
-		default:
-			if len(atomicResp.Load().(*PeerAndSidecars).Responses) > 0 {
-				break Loop
-			}
-			time.Sleep(10 * time.Millisecond)
+	respChan := make(chan PeerAndSidecars, 50)
+	nopeersErrChan := make(chan error, 50)
+	respErrChan := make(chan error, 50)
+
+	var requestFn func(loopCount int, countStart int)
+	requestFn = func(loopCount int, countStart int) {
+		if loopCount > 2 {
+			return
 		}
+
+		select {
+		case <-ctx1.Done():
+			return
+		default:
+		}
+		responses, pid, err := r.SendBlobsSidecarByIdentifierReq(ctx1, req)
+
+		if err != nil {
+			select {
+			case <-ctx1.Done():
+				return
+			default:
+			}
+			log.Warn("LoopingRequestBlobs: error", "err", err, "peer", pid, "size", req.Len(), "loopCount", loopCount, "countstart", countStart)
+			needRetry := true
+			if strings.Contains(err.Error(), "no addresses") {
+				// needRetry = false
+				r.BanPeer(pid)
+			}
+			if strings.Contains(err.Error(), "peer error code: 1") {
+				respErrChan <- err
+				r.BanPeer(pid)
+			}
+			if errors.Is(err, peers.ErrNoPeers) {
+				log.Warn("LoopingRequestBlobs: No peers available")
+				nopeersErrChan <- err
+				needRetry = false
+			}
+			if needRetry {
+				requestFn(loopCount+1, countStart)
+			}
+			return
+		}
+		if responses == nil {
+			log.Warn("LoopingRequestBlobs: response is nil", "peer", pid)
+			return
+		}
+		if len(responses) == 0 {
+			return
+		}
+		resp := PeerAndSidecars{
+			Peer:      pid,
+			Responses: responses,
+		}
+		respChan <- resp
 	}
-	return atomicResp.Load().(*PeerAndSidecars), nil
+
+	var delay time.Duration
+	if req.Len() <= 3 {
+		delay = 500 * time.Millisecond
+	} else if req.Len() <= 6 {
+		delay = 1000 * time.Millisecond
+	} else if req.Len() <= 9 {
+		delay = 1500 * time.Millisecond
+	} else if req.Len() <= 12 {
+		delay = 2000 * time.Millisecond
+	} else if req.Len() <= 15 {
+		delay = 2500 * time.Millisecond
+	} else {
+		delay = 3000 * time.Millisecond
+	}
+
+	go func() {
+		go requestFn(0, 0)
+		for i := 1; ; i++ {
+			select {
+			case <-ctx1.Done():
+				return
+			case <-nopeersErrChan:
+				for len(nopeersErrChan) > 0 {
+					<-nopeersErrChan
+				}
+				requestFn(0, i) //sync request
+			case <-time.After(delay):
+				go requestFn(0, i)
+			}
+		}
+	}()
+
+	return respChan, respErrChan, cancel
 }

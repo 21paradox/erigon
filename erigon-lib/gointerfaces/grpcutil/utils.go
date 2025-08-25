@@ -114,7 +114,11 @@ func Connect(creds credentials.TransportCredentials, dialAddress string) (*grpc.
 	dialOpts = []grpc.DialOption{
 		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffCfg, MinConnectTimeout: 10 * time.Minute}),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(int(200 * datasize.MB))),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{}),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: false,
+		}),
 	}
 	if creds == nil {
 		dialOpts = append(dialOpts, grpc.WithInsecure())

@@ -18,8 +18,8 @@ package network
 
 import (
 	"errors"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/context"
@@ -78,84 +78,108 @@ type peerAndBlocks struct {
 }
 
 func (f *ForwardBeaconDownloader) RequestMore(ctx context.Context) {
-	count := uint64(32)
-	var atomicResp atomic.Value
-	atomicResp.Store(peerAndBlocks{})
-	reqInterval := time.NewTicker(300 * time.Millisecond)
-	defer reqInterval.Stop()
-
-Loop:
-	for {
+	count := uint64(16)
+	respChan := make(chan peerAndBlocks)
+	nopeersErrChan := make(chan error, 5)
+	var requestFn func(ctx context.Context, loopCount int)
+	requestFn = func(ctx context.Context, loopCount int) {
+		if loopCount > 3 {
+			return
+		}
 		select {
-		case <-reqInterval.C:
-			go func() {
-				if len(atomicResp.Load().(peerAndBlocks).blocks) > 0 {
-					return
-				}
-				var reqSlot uint64
-				if f.highestSlotProcessed > 2 {
-					reqSlot = f.highestSlotProcessed - 2
-				}
-				// double the request count every 10 seconds. This is inspired by the mekong network, which has many consecutive missing blocks.
-				reqCount := count
-				// NEED TO COMMENT THIS BC IT CAUSES ISSUES ON MAINNET
-
-				// if !f.highestSlotUpdateTime.IsZero() {
-				// 	multiplier := int(time.Since(f.highestSlotUpdateTime).Seconds()) / 10
-				// 	multiplier = min(multiplier, 6)
-				// 	reqCount *= uint64(1 << uint(multiplier))
-				// }
-
-				// leave a warning if we are stuck for more than 90 seconds
-				if time.Since(f.highestSlotUpdateTime) > 90*time.Second {
-					log.Trace("Forward beacon downloader gets stuck", "time", time.Since(f.highestSlotUpdateTime).Seconds(), "highestSlotProcessed", f.highestSlotProcessed)
-				}
-				// this is so we do not get stuck on a side-fork
-				responses, peerId, err := f.rpc.SendBeaconBlocksByRangeReq(ctx, reqSlot, reqCount)
-				if err != nil {
-					if errors.Is(err, peers.ErrNoPeers) {
-						log.Trace("No peers available for beacon blocks by range request", "err", err, "peer", peerId, "slot", reqSlot, "reqCount", reqCount)
-					} else {
-						log.Debug("Failed to send beacon blocks by range request", "err", err, "peer", peerId, "slot", reqSlot, "reqCount", reqCount)
-					}
-					return
-				}
-				if responses == nil {
-					return
-				}
-				if len(responses) == 0 {
-					f.rpc.BanPeer(peerId)
-					return
-				}
-				if len(atomicResp.Load().(peerAndBlocks).blocks) > 0 {
-					return
-				}
-				atomicResp.Store(peerAndBlocks{peerId, responses})
-			}()
 		case <-ctx.Done():
 			return
 		default:
-			if len(atomicResp.Load().(peerAndBlocks).blocks) > 0 {
-				break Loop
-			}
-			time.Sleep(10 * time.Millisecond)
 		}
+		var reqSlot uint64
+		if f.highestSlotProcessed > 2 {
+			reqSlot = f.highestSlotProcessed - 2
+		}
+		// double the request count every 10 seconds. This is inspired by the mekong network, which has many consecutive missing blocks.
+		reqCount := count
+		// NEED TO COMMENT THIS BC IT CAUSES ISSUES ON MAINNET
+
+		// if !f.highestSlotUpdateTime.IsZero() {
+		// 	multiplier := int(time.Since(f.highestSlotUpdateTime).Seconds()) / 10
+		// 	multiplier = min(multiplier, 6)
+		// 	reqCount *= uint64(1 << uint(multiplier))
+		// }
+
+		// leave a warning if we are stuck for more than 90 seconds
+		if time.Since(f.highestSlotUpdateTime) > 90*time.Second {
+			log.Trace("Forward beacon downloader gets stuck", "time", time.Since(f.highestSlotUpdateTime).Seconds(), "highestSlotProcessed", f.highestSlotProcessed)
+		}
+		// this is so we do not get stuck on a side-fork
+		responses, peerId, err := f.rpc.SendBeaconBlocksByRangeReq(ctx, reqSlot, reqCount)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			needRetry := true
+			if strings.Contains(err.Error(), "no addresses") {
+				f.rpc.BanPeer(peerId)
+			}
+			if errors.Is(err, peers.ErrNoPeers) {
+				log.Trace("No peers available for beacon blocks by range request", "err", err, "peer", peerId, "slot", reqSlot, "reqCount", reqCount)
+				nopeersErrChan <- err
+				needRetry = false
+			}
+			log.Warn("Failed to send beacon blocks by range request", "err", err, "peer", peerId, "slot", reqSlot, "reqCount", reqCount, "loopCount", loopCount)
+			if needRetry {
+				requestFn(ctx, loopCount+1)
+			}
+			return
+		}
+		if responses == nil {
+			return
+		}
+		if len(responses) == 0 {
+			f.rpc.BanPeer(peerId)
+			return
+		}
+		respChan <- peerAndBlocks{peerId, responses}
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	reqCtx, cancel := context.WithCancel(ctx)
 
-	var highestSlotProcessed uint64
-	var err error
-	blocks := atomicResp.Load().(peerAndBlocks).blocks
-	pid := atomicResp.Load().(peerAndBlocks).peerId
-	if highestSlotProcessed, err = f.process(f.highestSlotProcessed, blocks); err != nil {
-		f.rpc.BanPeer(pid)
+	go func() {
+		go requestFn(reqCtx, 0)
+		for {
+			select {
+			case <-reqCtx.Done():
+				return
+			case <-nopeersErrChan:
+				for len(nopeersErrChan) > 0 {
+					<-nopeersErrChan
+				}
+				requestFn(reqCtx, 0) //sync request
+			case <-time.After(3 * time.Second):
+				go requestFn(reqCtx, 0)
+			}
+		}
+	}()
+
+	select {
+	case <-reqCtx.Done():
 		return
-	}
-	if highestSlotProcessed > f.highestSlotProcessed {
-		f.highestSlotProcessed = highestSlotProcessed
-		f.highestSlotUpdateTime = time.Now()
+	case atomicResp, ok := <-respChan:
+		if ok {
+			cancel()
+
+			var highestSlotProcessed uint64
+			var err error
+			blocks := atomicResp.blocks
+			if highestSlotProcessed, err = f.process(f.highestSlotProcessed, blocks); err != nil {
+				return
+			}
+			if highestSlotProcessed > f.highestSlotProcessed {
+				f.highestSlotProcessed = highestSlotProcessed
+				f.highestSlotUpdateTime = time.Now()
+			}
+			return
+		}
 	}
 }
 

@@ -68,6 +68,7 @@ func Do(handler http.Handler, r *http.Request) (resp *http.Response, err error) 
 // Handles a request
 func NewRequestHandler(host host.Host) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		reqCtx := r.Context()
 		// get the peer parameters
 		peerIdBase58 := r.Header.Get("REQRESP-PEER-ID")
 		topic := r.Header.Get("REQRESP-TOPIC")
@@ -96,6 +97,13 @@ func NewRequestHandler(host host.Host) http.HandlerFunc {
 		defer stream.Close()
 		// this write deadline is not part of the eth p2p spec, but we are implying it.
 		stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		select {
+		case <-reqCtx.Done():
+			http.Error(w, "reqctx ended: "+reqCtx.Err().Error(), http.StatusBadRequest)
+			return
+		default:
+		}
+
 		if r.Body != nil && r.ContentLength > 0 {
 			_, err := io.Copy(stream, r.Body)
 			if err != nil {
@@ -110,7 +118,7 @@ func NewRequestHandler(host host.Host) http.HandlerFunc {
 		}
 		code := make([]byte, 1)
 		// we have 5 seconds to read the next byte. this is the 5 TTFB_TIMEOUT in the spec
-		stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+		stream.SetReadDeadline(time.Now().Add(8 * time.Second))
 		n, err := io.ReadFull(stream, code)
 		if err != nil {
 			http.Error(w, "Read Code: "+err.Error()+", readBytes="+strconv.Itoa(n), http.StatusBadRequest)
@@ -128,11 +136,29 @@ func NewRequestHandler(host host.Host) http.HandlerFunc {
 		stream.SetReadDeadline(time.Now().Add(10 * time.Second * time.Duration(chunks)))
 		// copy the data now to the stream
 		// the first write to w will call code 200, so we do not need to
-		_, err = io.Copy(w, stream)
-		if err != nil {
-			http.Error(w, "Reading Stream Response: "+err.Error(), http.StatusBadRequest)
-			return
+
+		buf := make([]byte, 32*1024)
+		for {
+			select {
+			case <-reqCtx.Done():
+				http.Error(w, "reqctx ended: "+reqCtx.Err().Error(), http.StatusBadRequest)
+				return
+			default:
+			}
+			nr, err := stream.Read(buf)
+			if nr > 0 {
+				if _, err := w.Write(buf[:nr]); err != nil {
+					http.Error(w, "write response: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					return
+				}
+				http.Error(w, "read stream: "+err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
-		return
 	}
 }

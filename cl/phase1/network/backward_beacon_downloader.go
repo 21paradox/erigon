@@ -17,7 +17,9 @@
 package network
 
 import (
+	"errors"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +33,7 @@ import (
 	"github.com/erigontech/erigon/cl/persistence/beacon_indicies"
 	"github.com/erigontech/erigon/cl/phase1/execution_client"
 	"github.com/erigontech/erigon/cl/rpc"
+	"github.com/erigontech/erigon/cl/sentinel/peers"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
 )
@@ -123,44 +126,93 @@ func (b *BackwardBeaconDownloader) Peers() (uint64, error) {
 // If the callback returns an error or signals that the download should be finished, the function will exit.
 // If the block's root hash does not match the expected root hash, it will be rejected and the function will continue to the next block.
 func (b *BackwardBeaconDownloader) RequestMore(ctx context.Context) error {
-	count := uint64(16)
+	count := uint64(64)
 	start := b.slotToDownload.Load() - count + 1
 	// Overflow? round to 0.
 	if start > b.slotToDownload.Load() {
 		start = 0
 	}
+	respChan := make(chan []*cltypes.SignedBeaconBlock)
 	var atomicResp atomic.Value
 	atomicResp.Store([]*cltypes.SignedBeaconBlock{})
+
+	nopeersErrChan := make(chan error, 5)
+	var requestFn func(ctx context.Context, loopCount int)
+	requestFn = func(ctx context.Context, loopCount int) {
+		if loopCount > 3 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if len(atomicResp.Load().([]*cltypes.SignedBeaconBlock)) > 0 {
+			return
+		}
+		responses, peerId, err := b.rpc.SendBeaconBlocksByRangeReq(ctx, start, count)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			needRetry := true
+			if strings.Contains(err.Error(), "no addresses") {
+				b.rpc.BanPeer(peerId)
+			}
+			if errors.Is(err, peers.ErrNoPeers) {
+				log.Trace("No peers available for beacon blocks by range request", "err", err, "peer", peerId, "slot")
+				nopeersErrChan <- err
+				needRetry = false
+			}
+			log.Warn("Failed to send beacon blocks by range request/backwards", "err", err, "peer", peerId, "slot", loopCount)
+			if needRetry {
+				requestFn(ctx, loopCount+1)
+			}
+			return
+		}
+		if responses == nil {
+			b.rpc.BanPeer(peerId)
+			return
+		}
+		if len(responses) == 0 {
+			b.rpc.BanPeer(peerId)
+			return
+		}
+		respChan <- responses
+		atomicResp.Store(responses)
+	}
+	reqCtx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		go requestFn(reqCtx, 0)
+		for {
+			select {
+			case <-reqCtx.Done():
+				return
+			case <-nopeersErrChan:
+				for len(nopeersErrChan) > 0 {
+					<-nopeersErrChan
+				}
+				requestFn(reqCtx, 0) //sync request
+			case <-time.After(3 * time.Second):
+				go requestFn(reqCtx, 0)
+			}
+		}
+	}()
 
 Loop:
 	for {
 		select {
-		case <-b.reqInterval.C:
-			go func() {
-				if len(atomicResp.Load().([]*cltypes.SignedBeaconBlock)) > 0 {
-					return
-				}
-				responses, peerId, err := b.rpc.SendBeaconBlocksByRangeReq(ctx, start, count)
-				if err != nil {
-					b.rpc.BanPeer(peerId)
-					return
-				}
-				if responses == nil {
-					b.rpc.BanPeer(peerId)
-					return
-				}
-				if len(responses) == 0 {
-					b.rpc.BanPeer(peerId)
-					return
-				}
-				atomicResp.Store(responses)
-			}()
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case <-respChan:
 			if len(atomicResp.Load().([]*cltypes.SignedBeaconBlock)) > 0 {
+				cancel()
 				break Loop
 			}
+
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
