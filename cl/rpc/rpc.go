@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/erigontech/erigon/cl/sentinel/communication"
 	"github.com/erigontech/erigon/cl/sentinel/communication/ssz_snappy"
@@ -73,8 +72,6 @@ func (b *BeaconRpcP2P) sendBlocksRequest(ctx context.Context, topic string, reqD
 	// Prepare output slice.
 	responsePacket := []*cltypes.SignedBeaconBlock{}
 
-	ctx, cn := context.WithTimeout(ctx, time.Second*2)
-	defer cn()
 	message, err := b.sentinel.SendRequest(ctx, &sentinel.RequestData{
 		Data:  reqData,
 		Topic: topic,
@@ -147,12 +144,17 @@ func (b *BeaconRpcP2P) sendBlobsSidecar(ctx context.Context, topic string, reqDa
 	// Prepare output slice.
 	responsePacket := []*cltypes.BlobSidecar{}
 
-	ctx, cn := context.WithTimeout(ctx, time.Second*2)
-	defer cn()
+	// ctx, cn := context.WithTimeout(ctx, time.Second*20)
+	// defer cn()
 	message, err := b.sentinel.SendRequest(ctx, &sentinel.RequestData{
 		Data:  reqData,
 		Topic: topic,
 	})
+	select {
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	default:
+	}
 	if err != nil {
 		return nil, "", err
 	}

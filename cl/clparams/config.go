@@ -352,14 +352,30 @@ var NetworkConfigs map[NetworkType]NetworkConfig = map[NetworkType]NetworkConfig
 	},
 }
 
+func sUrl(s string) string {
+	return "http://localhost:8088/" + s
+}
+
 // Trusted checkpoint sync endpoints: https://eth-clients.github.io/checkpoint-sync-endpoints/
 var CheckpointSyncEndpoints = map[NetworkType][]string{
 	MainnetNetwork: {
-		"https://sync.invis.tools/eth/v2/debug/beacon/states/finalized",
-		"https://mainnet-checkpoint-sync.attestant.io/eth/v2/debug/beacon/states/finalized",
+		// "https://mainnet-checkpoint-sync.attestant.io/eth/v2/debug/beacon/states/finalized",
+		// "https://sync-mainnet.beaconcha.in/eth/v2/debug/beacon/states/finalized",
+		// "https://mainnet-checkpoint-sync.stakely.io/eth/v2/debug/beacon/states/finalized",
+		// "https://beaconstate.info/eth/v2/debug/beacon/states/finalized",
+		// "https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized",
+		// "https://sync.invis.tools/eth/v2/debug/beacon/states/finalized",
+
 		//"https://mainnet.checkpoint.sigp.io/eth/v2/debug/beacon/states/finalized",
-		"https://mainnet-checkpoint-sync.stakely.io/eth/v2/debug/beacon/states/finalized",
-		"https://checkpointz.pietjepuk.net/eth/v2/debug/beacon/states/finalized",
+		sUrl("https://sync-mainnet.beaconcha.in/eth/v2/debug/beacon/states/finalized"),
+		sUrl("https://beaconstate.info/eth/v2/debug/beacon/states/finalized"),
+		sUrl("https://beaconstate.ethstaker.cc/eth/v2/debug/beacon/states/finalized"),
+		sUrl("https://checkpointz.pietjepuk.net/eth/v2/debug/beacon/states/finalized"),
+		sUrl("https://mainnet-checkpoint-sync.stakely.io/eth/v2/debug/beacon/states/finalized"),
+		sUrl("https://mainnet-checkpoint-sync.attestant.io/eth/v2/debug/beacon/states/finalized"),
+		sUrl("http://testing.mainnet.beacon-api.nimbus.team/eth/v2/debug/beacon/states/finalized"),
+		// sUrl("https://sync.invis.tools/eth/v2/debug/beacon/states/finalized"),
+		//"https://mainnet.checkpoint.sigp.io/eth/v2/debug/beacon/states/finalized",
 	},
 	SepoliaNetwork: {
 		//"https://beaconstate-sepolia.chainsafe.io/eth/v2/debug/beacon/states/finalized",

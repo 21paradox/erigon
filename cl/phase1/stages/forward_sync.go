@@ -19,6 +19,7 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice"
 	network2 "github.com/erigontech/erigon/cl/phase1/network"
+	"golang.org/x/sync/errgroup"
 )
 
 // shouldProcessBlobs checks if any block in the given list of blocks
@@ -60,48 +61,195 @@ func shouldProcessBlobs(blocks []*cltypes.SignedBeaconBlock, cfg *Cfg) bool {
 // It takes highest slot processed, and a list of signed beacon blocks as input.
 // It returns the highest blob slot processed and an error if any.
 func downloadAndProcessEip4844DA(ctx context.Context, logger log.Logger, cfg *Cfg, highestSlotProcessed uint64, blocks []*cltypes.SignedBeaconBlock) (highestBlobSlotProcessed uint64, err error) {
-	var (
-		ids   *solid.ListSSZ[*cltypes.BlobIdentifier]
-		blobs *network2.PeerAndSidecars
-	)
 
-	// Retrieve blob identifiers from the given blocks
-	ids, err = network2.BlobsIdentifiersFromBlocks(blocks, cfg.beaconCfg)
-	if err != nil {
-		// Return an error if blob identifiers could not be retrieved
-		err = fmt.Errorf("failed to get blob identifiers: %w", err)
-		return
+	const chunkSize = 9
+	const maxChunkSize = 15
+	bindex := 0
+	type blobsWithBlocks struct {
+		ids    *solid.ListSSZ[*cltypes.BlobIdentifier]
+		blocks []*cltypes.SignedBeaconBlock
 	}
 
-	// If there are no blobs to retrieve, return the highest slot processed
-	if ids.Len() == 0 {
-		return highestSlotProcessed, nil
+	var allEntries []blobsWithBlocks
+
+	for bindex < len(blocks)-1 {
+		end := bindex + 1
+		for end <= len(blocks)-1 {
+			ids, err1 := network2.BlobsIdentifiersFromBlocks(blocks[bindex:end], cfg.beaconCfg)
+			if err1 != nil {
+				err = fmt.Errorf("failed to get blob identifiers: %w", err1)
+				return
+			}
+			if ids.Len() == 0 {
+				end++
+				continue
+			}
+			if ids.Len() > maxChunkSize {
+				end--
+				break
+			}
+			if ids.Len() >= chunkSize {
+				break
+			}
+			end++
+		}
+		ids, err1 := network2.BlobsIdentifiersFromBlocks(blocks[bindex:end], cfg.beaconCfg)
+		if err1 != nil {
+			err = fmt.Errorf("failed to get blob identifiers: %w", err1)
+			return
+		}
+		if ids.Len() > 0 {
+			allEntries = append(allEntries, blobsWithBlocks{
+				ids:    ids,
+				blocks: blocks[bindex:end],
+			})
+		}
+		bindex = end
 	}
 
-	// Request blobs from the network
-	blobs, err = network2.RequestBlobsFrantically(ctx, cfg.rpc, ids)
-	if err != nil {
-		// Return an error if blobs could not be retrieved
-		err = fmt.Errorf("failed to get blobs: %w", err)
-		return
+	blocksToProcess := blocks[bindex:]
+	for _, block := range blocksToProcess {
+		blocks1 := []*cltypes.SignedBeaconBlock{block}
+		subids, err2 := network2.BlobsIdentifiersFromBlocks(blocks1, cfg.beaconCfg)
+		if err2 != nil {
+			err = fmt.Errorf("failed to get blob identifiers: %w", err2)
+			return
+		}
+		allEntries = append(allEntries, blobsWithBlocks{
+			ids:    subids,
+			blocks: blocks1,
+		})
 	}
 
-	var highestProcessed, inserted uint64
-	// Verify and insert blobs into the blob store
-	if highestProcessed, inserted, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStore, ids, blobs.Responses, nil); err != nil {
-		// Ban the peer if verification fails
-		cfg.rpc.BanPeer(blobs.Peer)
-		// Return an error if blobs could not be verified
-		err = fmt.Errorf("failed to verify blobs: %w", err)
-		return
-	}
-	// If all blobs were inserted successfully, return the highest processed slot
-	if inserted == uint64(ids.Len()) {
-		return highestProcessed, nil
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(3)
+	hprocessedChan := make(chan uint64)
+
+	highestSlotProcessedNow := highestSlotProcessed
+	go func() {
+		for hprocess := range hprocessedChan {
+			if hprocess > highestSlotProcessedNow {
+				highestSlotProcessedNow = hprocess
+			}
+		}
+	}()
+
+	for loopIdx, entity := range allEntries {
+		select {
+		case <-ctx.Done():
+			// Context canceled or timed out
+			return highestSlotProcessedNow, ctx.Err()
+		default:
+		}
+
+		if entity.ids.Len() == 0 {
+			continue
+		}
+		var processIDs func(entity blobsWithBlocks, nestcall bool, lastLoop bool) error
+		processIDs = func(entity blobsWithBlocks, nestcall bool, lastLoop bool) error {
+			ids := entity.ids
+			respChan, respErrChan, cancel := network2.RequestBlobsFrantically(egCtx, cfg.rpc, ids)
+			var errRet error
+
+			retryProcess := func(entity blobsWithBlocks) error {
+				for _, block := range entity.blocks {
+					subids, err2 := network2.BlobsIdentifiersFromBlocks([]*cltypes.SignedBeaconBlock{block}, cfg.beaconCfg)
+					if err2 != nil {
+						panic(err2)
+					}
+					if subids.Len() == 0 {
+						continue
+					}
+					entitySmall := blobsWithBlocks{
+						ids:    subids,
+						blocks: []*cltypes.SignedBeaconBlock{block},
+					}
+					if err1 := processIDs(entitySmall, true, lastLoop); err1 != nil {
+						return err1
+					}
+				}
+				return nil
+			}
+
+			respErrCount := 0
+		Loop:
+			for i := 0; ; {
+				select {
+				case <-egCtx.Done():
+					cancel()
+					return egCtx.Err()
+				case blobs, ok := <-respChan:
+					i += 1
+					if !ok {
+						cancel()
+						break Loop
+					}
+
+					// Verify the blobs against identifiers and insert them into the blob store
+					hprocessed, inserted, errverify := blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStore, ids, blobs.Responses, nil)
+					log.Warn("inserted equal check in forward", "ids.len", ids.Len(), "inserted", inserted)
+
+					if errverify == nil && inserted == uint64(ids.Len()) {
+						errRet = nil
+						hprocessedChan <- hprocessed
+						cancel()
+						break Loop
+					} else {
+						if hprocessed > 0 {
+							hprocessedChan <- hprocessed - 1
+						}
+						if errverify != nil {
+							log.Warn("inserted equal check forward err", "err", errverify.Error())
+							errRet = fmt.Errorf("failed to verify blobs: %w", errverify)
+						}
+						if lastLoop && i > 3 {
+							cancel()
+							break Loop
+						}
+						if nestcall {
+							if i > 10 {
+								cancel()
+								break Loop
+							}
+						}
+						if !lastLoop && i > 3 && !nestcall {
+							cancel()
+							errRet = nil
+							if err1 := retryProcess(entity); err1 != nil {
+								return err1
+							}
+							break Loop
+						}
+					}
+				case <-respErrChan:
+					respErrCount += 1
+					if respErrCount > 7 {
+						cancel()
+						if err1 := retryProcess(entity); err1 != nil {
+							return err1
+						}
+						break Loop
+					}
+				}
+			}
+			return errRet
+		}
+
+		normalEntity := entity
+		isLastLoopIds := loopIdx == len(allEntries)-1
+		eg.Go(func() error {
+			return processIDs(normalEntity, false, isLastLoopIds)
+		})
 	}
 
-	// If not all blobs were inserted, return the highest processed slot minus one
-	return highestProcessed - 1, err
+	errinGroup := eg.Wait()
+	close(hprocessedChan)
+
+	if errinGroup != nil {
+		return highestSlotProcessedNow, errinGroup
+	}
+
+	return highestSlotProcessedNow, nil
 }
 
 // processDownloadedBlockBatches processes a batch of downloaded blocks.

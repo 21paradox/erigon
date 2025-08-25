@@ -28,6 +28,7 @@ import (
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cl/antiquary"
+	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/persistence/beacon_indicies"
 	"github.com/erigontech/erigon/cl/persistence/blob_storage"
 	"github.com/erigontech/erigon/cl/phase1/execution_client"
@@ -259,6 +260,11 @@ func SpawnStageHistoryDownload(cfg StageHistoryReconstructionCfg, ctx context.Co
 
 				if !isDownloadingForBeacon {
 					remaining := float64(highestBlockSeen - lowestBlockToReach)
+					log.Info(
+						"Downloading Execution History debug", "highestBlockSeen", highestBlockSeen,
+						"currEth1Progress.Load()", currEth1Progress.Load(),
+						"lowestBlockToReach", lowestBlockToReach,
+					)
 					log.Info("Downloading Execution History", "progress",
 						fmt.Sprintf("%d/%d", highestBlockSeen-uint64(currEth1Progress.Load()), highestBlockSeen-lowestBlockToReach),
 						"ETA", (time.Duration(remaining/speed) * time.Second).String(),
@@ -303,7 +309,7 @@ func SpawnStageHistoryDownload(cfg StageHistoryReconstructionCfg, ctx context.Co
 					case <-ctx.Done():
 						return
 					case <-ticker.C:
-						if err := downloadBlobHistoryWorker(cfg, ctx, false, logger); err != nil {
+						if err := downloadBlobHistoryWorker(cfg, ctx, true, logger); err != nil {
 							logger.Error("Error downloading blobs", "err", err)
 						}
 					}
@@ -347,7 +353,7 @@ func downloadBlobHistoryWorker(cfg StageHistoryReconstructionCfg, ctx context.Co
 	if !cfg.caplinConfig.ArchiveBlobs && cfg.caplinConfig.ImmediateBlobsBackfilling {
 		targetSlot = currentSlot - min(currentSlot, cfg.beaconCfg.MinSlotsForBlobsSidecarsRequest())
 	}
-	logger.Info("[Blobs-Downloader] Downloading blobs backwards", "slot", currentSlot)
+	logger.Info("[Blobs-Downloader] Downloading blobs backwards", "slot", currentSlot, "targetslot", targetSlot)
 
 	for currentSlot >= targetSlot {
 		if currentSlot <= cfg.sn.FrozenBlobs() {
@@ -366,6 +372,7 @@ func downloadBlobHistoryWorker(cfg StageHistoryReconstructionCfg, ctx context.Co
 			}
 			block, err := cfg.blockReader.ReadBlindedBlockBySlot(ctx, tx, currentSlot-visited)
 			if err != nil {
+				cfg.logger.Warn("[Blobs-Downloader] ReadBlindedBlockBySlot", "err", err)
 				return err
 			}
 			if block == nil {
@@ -376,10 +383,12 @@ func downloadBlobHistoryWorker(cfg StageHistoryReconstructionCfg, ctx context.Co
 			}
 			blockRoot, err := block.Block.HashSSZ()
 			if err != nil {
+				cfg.logger.Warn("[Blobs-Downloader] HashSSZ", "err", err)
 				return err
 			}
 			blobsCount, err := cfg.blobStorage.KzgCommitmentsCount(ctx, blockRoot)
 			if err != nil {
+				cfg.logger.Warn("[Blobs-Downloader] KzgCommitmentsCount", "err", err)
 				return err
 			}
 
@@ -406,39 +415,99 @@ func downloadBlobHistoryWorker(cfg StageHistoryReconstructionCfg, ctx context.Co
 			prevLogSlot = currentSlot
 			prevTime = time.Now()
 
-			logger.Info("[Blobs-Downloader] Downloading blobs backwards", "slot", currentSlot, "blks/sec", blkSecStr)
+			logger.Info("[Blobs-Downloader] Downloading blobs backwards", "slot", currentSlot, "blks/sec", blkSecStr, "blocks", len(batch))
 		default:
 		}
-		// Generate the request
-		req, err := network.BlobsIdentifiersFromBlindedBlocks(batch, cfg.beaconCfg)
-		if err != nil {
-			cfg.logger.Debug("Error generating blob identifiers", "err", err)
-			continue
-		}
-		// Request the blobs
-		blobs, err := network.RequestBlobsFrantically(ctx, rpc, req)
-		if err != nil {
-			cfg.logger.Debug("Error requesting blobs", "err", err)
-			continue
-		}
-		_, _, err = blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStorage, req, blobs.Responses, func(header *cltypes.SignedBeaconBlockHeader) error {
-			// The block is preverified so just check that the signature is correct against the block
-			for _, block := range batch {
-				if block.Block.Slot != header.Header.Slot {
+
+		allIds := []*solid.ListSSZ[*cltypes.BlobIdentifier]{}
+		blocks := batch
+		const chunkSize = 6
+		const maxChunkSize = 15
+		bindex := 0
+		for bindex < len(blocks) {
+			end := bindex + 1
+			for end <= len(blocks) {
+				ids, err2 := network.BlobsIdentifiersFromBlindedBlocks(blocks[bindex:end], cfg.beaconCfg)
+				if err2 != nil {
+					return err2
+				}
+				if ids.Len() == 0 {
+					end++
 					continue
 				}
-				if block.Signature != header.Signature {
-					return errors.New("signature mismatch between blob and stored block")
+				if ids.Len() > maxChunkSize {
+					end--
+					break
 				}
-				return nil
+				if ids.Len() >= chunkSize {
+					break
+				}
+				end++
 			}
-			return errors.New("block not in batch")
-		})
-		if err != nil {
-			rpc.BanPeer(blobs.Peer)
-			cfg.logger.Warn("Error verifying blobs", "err", err)
-			continue
+			if end > len(blocks) {
+				end = len(blocks)
+			}
+			ids, err2 := network.BlobsIdentifiersFromBlindedBlocks(blocks[bindex:end], cfg.beaconCfg)
+			if err2 != nil {
+				err = err2
+				cfg.logger.Warn("Error generating blob identifiers", "err", err)
+				return err2
+			}
+			if ids.Len() > 0 {
+				allIds = append(allIds, ids)
+			}
+			bindex = end
 		}
+
+		for _, ids := range allIds {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			respChan, respErrChan, cancel := network.RequestBlobsFrantically(ctx, rpc, ids)
+			errcount := 0
+
+		Loop:
+			for {
+				select {
+				case <-ctx.Done():
+					cancel()
+					break Loop
+				case <-respErrChan:
+
+				case blobs := <-respChan:
+					_, inserted, errverify := blob_storage.VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx, cfg.blobStorage, ids, blobs.Responses, func(header *cltypes.SignedBeaconBlockHeader) error {
+						// The block is preverified so just check that the signature is correct against the block
+						for _, block := range batch {
+							if block.Block.Slot != header.Header.Slot {
+								continue
+							}
+							if block.Signature != header.Signature {
+								return errors.New("signature mismatch between blob and stored block")
+							}
+							return nil
+						}
+						return errors.New("block not in batch")
+					})
+
+					if errverify == nil && inserted == uint64(ids.Len()) {
+						cancel()
+						break Loop
+					} else {
+						logger.Warn("[Blobs-Downloader] verify", "errverify", errverify, "errcount", errcount, "inserted", inserted, "ids.len", ids.Len())
+						errcount += 1
+						if errcount > 10 {
+							err = errverify
+							cancel()
+							continue
+						}
+					}
+				}
+			}
+		}
+
 	}
 	if shouldLog {
 		logger.Info("[Blobs-Downloader] Blob history download finished successfully")

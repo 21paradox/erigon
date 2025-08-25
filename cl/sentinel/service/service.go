@@ -230,6 +230,10 @@ func (s *SentinelServer) requestPeer(ctx context.Context, pid peer.ID, req *sent
 			// don't ban the peer.
 			return nil, errorMessage
 		}
+		if strings.Contains(errorMessage.Error(), "reqctx ended") {
+			// don't ban the peer.
+			return nil, errorMessage
+		}
 		if shouldBanOnFail {
 			s.sentinel.Peers().RemovePeer(pid)
 			s.sentinel.Host().Peerstore().RemovePeer(pid)
@@ -273,12 +277,17 @@ func (s *SentinelServer) SendRequest(ctx context.Context, req *sentinelrpc.Reque
 	// Try finding the data to our peers
 	// this is using return statements instead of continue, since it saves a few lines
 	// but me writing this comment has put them back.. oh no!!! anyways, returning true means we stop.
-	peer, done, err := s.sentinel.Peers().Request()
+	item, done, err := s.sentinel.Peers().Request(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	pid := peer.Id()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	pid := item.Id()
 
 	resp, err := s.requestPeer(ctx, pid, req)
 	if err != nil {
